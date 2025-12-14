@@ -1,0 +1,451 @@
+// =============================================================================
+// AMT Trading Bot - TradingView Webhook Strategy
+// =============================================================================
+//
+// This Pine Script v6 strategy receives webhook signals from the AMT Trading Bot
+// and executes paper trades on TradingView.
+//
+// Webhook JSON Format Expected:
+// {
+//   "side": "LONG" or "SHORT",
+//   "entry": 450.25,
+//   "stop": 447.50,
+//   "target": 452.38,
+//   "symbol": "SPY",
+//   "timeframe": "15m"
+// }
+//
+// Author: AMT Trading Bot
+// Version: 2.0.0
+// Pine Script Version: 6
+//
+// =============================================================================
+
+//@version=6
+strategy(
+    title = "AMT Webhook Strategy",
+    shorttitle = "AMT-WH",
+    overlay = true,
+    pyramiding = 0,                    // Single position only - no pyramiding
+    default_qty_type = strategy.percent_of_equity,
+    default_qty_value = 100,           // Use 100% of allocated capital per trade
+    initial_capital = 100000,          // Starting capital for backtesting
+    currency = currency.USD,
+    commission_type = strategy.commission.cash_per_order,
+    commission_value = 1.0,            // $1 commission per order
+    slippage = 1,                      // 1 tick slippage
+    process_orders_on_close = false,   // Process orders on next bar open
+    calc_on_every_tick = false
+)
+
+
+// =============================================================================
+// SECTION 1: INPUT PARAMETERS
+// =============================================================================
+// These inputs receive values from webhook JSON payloads.
+// TradingView automatically maps JSON keys to input titles.
+
+// Webhook signal inputs - these are populated by the webhook JSON
+inp_side = input.string(
+    defval = "",
+    title = "side",
+    tooltip = "Trade direction: LONG or SHORT"
+)
+
+inp_entry = input.float(
+    defval = 0.0,
+    title = "entry",
+    tooltip = "Entry price for the trade"
+)
+
+inp_stop = input.float(
+    defval = 0.0,
+    title = "stop",
+    tooltip = "Stop loss price"
+)
+
+inp_target = input.float(
+    defval = 0.0,
+    title = "target",
+    tooltip = "Take profit target price"
+)
+
+// Optional: Symbol validation (for multi-chart setups)
+inp_symbol = input.string(
+    defval = "",
+    title = "symbol",
+    tooltip = "Trading symbol (for validation)"
+)
+
+
+// =============================================================================
+// SECTION 2: CONFIGURATION SETTINGS
+// =============================================================================
+// User-configurable settings for the strategy behavior
+
+// Risk management settings
+cfg_use_stop_loss = input.bool(
+    defval = true,
+    title = "Use Stop Loss",
+    group = "Risk Management"
+)
+
+cfg_use_take_profit = input.bool(
+    defval = true,
+    title = "Use Take Profit",
+    group = "Risk Management"
+)
+
+cfg_trail_stop = input.bool(
+    defval = false,
+    title = "Use Trailing Stop",
+    group = "Risk Management"
+)
+
+cfg_trail_offset = input.float(
+    defval = 1.0,
+    title = "Trailing Stop Offset (%)",
+    minval = 0.1,
+    maxval = 10.0,
+    step = 0.1,
+    group = "Risk Management"
+)
+
+// Signal filtering
+cfg_validate_symbol = input.bool(
+    defval = false,
+    title = "Validate Symbol Match",
+    tooltip = "Only execute if webhook symbol matches chart symbol",
+    group = "Signal Filtering"
+)
+
+cfg_min_price_dist = input.float(
+    defval = 0.0,
+    title = "Min Distance from Current Price (%)",
+    tooltip = "Minimum distance between entry and current price",
+    minval = 0.0,
+    maxval = 5.0,
+    step = 0.1,
+    group = "Signal Filtering"
+)
+
+
+// =============================================================================
+// SECTION 3: STATE VARIABLES
+// =============================================================================
+// Persistent variables to track state and prevent duplicate entries
+
+// Track the last processed signal to prevent duplicates
+var string last_side = ""
+var float last_entry = 0.0
+var float last_stop = 0.0
+var float last_target = 0.0
+var int last_signal_bar = 0
+
+// Track current position state
+var bool in_long = false
+var bool in_short = false
+
+
+// =============================================================================
+// SECTION 4: HELPER FUNCTIONS
+// =============================================================================
+
+// Check if we have a valid webhook signal
+isValidSignal() =>
+    // Must have side specified
+    bool has_side = inp_side == "LONG" or inp_side == "SHORT"
+
+    // Must have valid price levels
+    bool has_prices = inp_entry > 0 and inp_stop > 0 and inp_target > 0
+
+    // Return true only if all conditions met
+    has_side and has_prices
+
+// Check if this is a new signal (not a duplicate)
+isNewSignal() =>
+    // Compare against last processed signal
+    bool side_changed = inp_side != last_side
+    bool entry_changed = inp_entry != last_entry
+    bool stop_changed = inp_stop != last_stop
+    bool target_changed = inp_target != last_target
+
+    // Consider it new if any key field changed
+    side_changed or entry_changed or stop_changed or target_changed
+
+// Validate symbol matches chart (if enabled)
+isSymbolValid() =>
+    bool result = true
+    if cfg_validate_symbol and inp_symbol != ""
+        // Extract base symbol without exchange prefix
+        string chart_symbol = syminfo.ticker
+        result := str.contains(str.upper(chart_symbol), str.upper(inp_symbol))
+    result
+
+// Check price distance from current price
+isPriceDistanceValid() =>
+    bool result = true
+    if cfg_min_price_dist > 0
+        float distance_pct = math.abs(inp_entry - close) / close * 100
+        result := distance_pct >= cfg_min_price_dist
+    result
+
+// Check if we can enter a new position
+canEnterPosition() =>
+    // No existing position (pyramiding = 0 handles this, but explicit check)
+    bool no_position = strategy.position_size == 0
+    no_position
+
+
+// =============================================================================
+// SECTION 5: SIGNAL PROCESSING
+// =============================================================================
+
+// Determine if we have a valid, new signal to process
+bool valid_signal = isValidSignal()
+bool new_signal = isNewSignal()
+bool symbol_valid = isSymbolValid()
+bool price_valid = isPriceDistanceValid()
+bool can_enter = canEnterPosition()
+
+// Combined signal validation
+bool process_signal = valid_signal and new_signal and symbol_valid and price_valid
+
+// Determine signal direction
+bool is_long_signal = process_signal and inp_side == "LONG"
+bool is_short_signal = process_signal and inp_side == "SHORT"
+
+
+// =============================================================================
+// SECTION 6: TRADE EXECUTION
+// =============================================================================
+
+// Execute LONG entry
+if is_long_signal and can_enter
+    // Close any existing short position first
+    if strategy.position_size < 0
+        strategy.close("Short", comment = "Close Short for Long")
+
+    // Enter long position
+    strategy.entry(
+        id = "Long",
+        direction = strategy.long,
+        comment = "Long Entry @ " + str.tostring(inp_entry, "#.##")
+    )
+
+    // Set stop loss and take profit
+    if cfg_use_stop_loss and cfg_use_take_profit
+        strategy.exit(
+            id = "Long Exit",
+            from_entry = "Long",
+            stop = inp_stop,
+            limit = inp_target,
+            comment_profit = "TP Hit",
+            comment_loss = "SL Hit"
+        )
+    else if cfg_use_stop_loss
+        strategy.exit(
+            id = "Long SL",
+            from_entry = "Long",
+            stop = inp_stop,
+            comment_loss = "SL Hit"
+        )
+    else if cfg_use_take_profit
+        strategy.exit(
+            id = "Long TP",
+            from_entry = "Long",
+            limit = inp_target,
+            comment_profit = "TP Hit"
+        )
+
+    // Update state variables
+    last_side := inp_side
+    last_entry := inp_entry
+    last_stop := inp_stop
+    last_target := inp_target
+    last_signal_bar := bar_index
+    in_long := true
+    in_short := false
+
+// Execute SHORT entry
+if is_short_signal and can_enter
+    // Close any existing long position first
+    if strategy.position_size > 0
+        strategy.close("Long", comment = "Close Long for Short")
+
+    // Enter short position
+    strategy.entry(
+        id = "Short",
+        direction = strategy.short,
+        comment = "Short Entry @ " + str.tostring(inp_entry, "#.##")
+    )
+
+    // Set stop loss and take profit
+    if cfg_use_stop_loss and cfg_use_take_profit
+        strategy.exit(
+            id = "Short Exit",
+            from_entry = "Short",
+            stop = inp_stop,
+            limit = inp_target,
+            comment_profit = "TP Hit",
+            comment_loss = "SL Hit"
+        )
+    else if cfg_use_stop_loss
+        strategy.exit(
+            id = "Short SL",
+            from_entry = "Short",
+            stop = inp_stop,
+            comment_loss = "SL Hit"
+        )
+    else if cfg_use_take_profit
+        strategy.exit(
+            id = "Short TP",
+            from_entry = "Short",
+            limit = inp_target,
+            comment_profit = "TP Hit"
+        )
+
+    // Update state variables
+    last_side := inp_side
+    last_entry := inp_entry
+    last_stop := inp_stop
+    last_target := inp_target
+    last_signal_bar := bar_index
+    in_long := false
+    in_short := true
+
+
+// =============================================================================
+// SECTION 7: POSITION STATE TRACKING
+// =============================================================================
+
+// Update position state when positions close
+if strategy.position_size == 0
+    in_long := false
+    in_short := false
+
+
+// =============================================================================
+// SECTION 8: VISUAL INDICATORS
+// =============================================================================
+
+// Plot entry, stop, and target levels when in a position
+float plot_entry = strategy.position_size != 0 ? strategy.position_avg_price : na
+float plot_stop = strategy.position_size != 0 ? inp_stop : na
+float plot_target = strategy.position_size != 0 ? inp_target : na
+
+// Entry price line (blue)
+plot(
+    plot_entry,
+    title = "Entry",
+    color = color.blue,
+    linewidth = 1,
+    style = plot.style_linebr
+)
+
+// Stop loss line (red)
+plot(
+    plot_stop,
+    title = "Stop Loss",
+    color = color.red,
+    linewidth = 1,
+    style = plot.style_linebr
+)
+
+// Take profit line (green)
+plot(
+    plot_target,
+    title = "Take Profit",
+    color = color.green,
+    linewidth = 1,
+    style = plot.style_linebr
+)
+
+// Background color for position state
+color bgcolor_color = strategy.position_size > 0 ? color.new(color.green, 90) : strategy.position_size < 0 ? color.new(color.red, 90) : na
+bgcolor(bgcolor_color, title = "Position Background")
+
+
+// =============================================================================
+// SECTION 9: INFORMATION TABLE
+// =============================================================================
+
+// Display current state in a table
+var table info_table = table.new(
+    position = position.top_right,
+    columns = 2,
+    rows = 8,
+    bgcolor = color.new(color.black, 80),
+    border_width = 1
+)
+
+if barstate.islast
+    // Header
+    table.cell(info_table, 0, 0, "AMT Webhook", bgcolor = color.blue, text_color = color.white)
+    table.cell(info_table, 1, 0, "Status", bgcolor = color.blue, text_color = color.white)
+
+    // Position status
+    string pos_status = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+    color pos_color = strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.gray
+    table.cell(info_table, 0, 1, "Position", text_color = color.white)
+    table.cell(info_table, 1, 1, pos_status, text_color = pos_color)
+
+    // Last signal
+    table.cell(info_table, 0, 2, "Last Signal", text_color = color.white)
+    table.cell(info_table, 1, 2, last_side != "" ? last_side : "None", text_color = color.white)
+
+    // Entry price
+    table.cell(info_table, 0, 3, "Entry", text_color = color.white)
+    string entry_str = strategy.position_size != 0 ? str.tostring(strategy.position_avg_price, "#.##") : "-"
+    table.cell(info_table, 1, 3, entry_str, text_color = color.white)
+
+    // Stop loss
+    table.cell(info_table, 0, 4, "Stop", text_color = color.white)
+    string stop_str = last_stop > 0 ? str.tostring(last_stop, "#.##") : "-"
+    table.cell(info_table, 1, 4, stop_str, text_color = color.red)
+
+    // Target
+    table.cell(info_table, 0, 5, "Target", text_color = color.white)
+    string target_str = last_target > 0 ? str.tostring(last_target, "#.##") : "-"
+    table.cell(info_table, 1, 5, target_str, text_color = color.green)
+
+    // P&L
+    table.cell(info_table, 0, 6, "Open P&L", text_color = color.white)
+    string pnl_str = strategy.position_size != 0 ? str.tostring(strategy.openprofit, "#.##") : "-"
+    color pnl_color = strategy.openprofit >= 0 ? color.green : color.red
+    table.cell(info_table, 1, 6, pnl_str, text_color = pnl_color)
+
+    // Total trades
+    table.cell(info_table, 0, 7, "Total Trades", text_color = color.white)
+    table.cell(info_table, 1, 7, str.tostring(strategy.closedtrades), text_color = color.white)
+
+
+// =============================================================================
+// SECTION 10: ALERTS (for strategies, use alert() not alertcondition())
+// =============================================================================
+
+// Alert when a new long signal is processed
+if is_long_signal and can_enter
+    alert(
+        message = "AMT Bot: LONG signal. Entry: " + str.tostring(inp_entry) + ", Stop: " + str.tostring(inp_stop) + ", Target: " + str.tostring(inp_target),
+        freq = alert.freq_once_per_bar
+    )
+
+// Alert when a new short signal is processed
+if is_short_signal and can_enter
+    alert(
+        message = "AMT Bot: SHORT signal. Entry: " + str.tostring(inp_entry) + ", Stop: " + str.tostring(inp_stop) + ", Target: " + str.tostring(inp_target),
+        freq = alert.freq_once_per_bar
+    )
+
+// Alert when position closes
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    alert(
+        message = "AMT Bot: Position closed",
+        freq = alert.freq_once_per_bar
+    )
+
+
+// =============================================================================
+// END OF STRATEGY
+// =============================================================================
